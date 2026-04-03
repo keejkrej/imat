@@ -38,6 +38,10 @@ const SLIDER_ACTIVE: Color = Color::Rgb(220, 220, 255);
 const SLIDER_THUMB: Color = Color::Rgb(255, 200, 120);
 #[cfg(feature = "sam")]
 const MASK_TINT: [u8; 3] = [72, 200, 120];
+#[cfg(feature = "sam")]
+const SAM_CROSS_FG: Color = Color::Rgb(255, 40, 40);
+#[cfg(feature = "sam")]
+const SAM_CROSS_BG: Color = Color::Rgb(12, 12, 18);
 
 fn main() {
     if let Err(error) = try_main() {
@@ -467,11 +471,21 @@ fn normalization_for(color_type: ColorType) -> Normalization {
         ColorType::CMYK(8) | ColorType::CMYKA(8) | ColorType::YCbCr(8) | ColorType::Palette(8) => {
             Normalization::Fixed { lo: 0.0, hi: 255.0 }
         }
+        // High bit-depth RGB family: fixed full-scale maps scientific stacks (values in a small
+        // subrange of 16-bit) to black; match typical viewer behavior (min–max per plane).
         ColorType::RGB(bits)
         | ColorType::RGBA(bits)
         | ColorType::CMYK(bits)
         | ColorType::CMYKA(bits)
-            if bits > 0 && bits <= 32 =>
+            if bits > 8 && bits <= 32 =>
+        {
+            Normalization::Dynamic
+        }
+        ColorType::RGB(bits)
+        | ColorType::RGBA(bits)
+        | ColorType::CMYK(bits)
+        | ColorType::CMYKA(bits)
+            if bits > 0 && bits <= 8 =>
         {
             Normalization::Fixed {
                 lo: 0.0,
@@ -1602,6 +1616,40 @@ fn truncate(text: &str, max_cells: usize) -> String {
     out
 }
 
+/// Red + crosshair over the SAM cursor cell (arms extend `arm` cells each way).
+#[cfg(feature = "sam")]
+fn draw_sam_crosshair(buffer: &mut Buffer, area: Rect, cx: u16, cy: u16, arm: i32) {
+    let w = area.width as i32;
+    let h = area.height as i32;
+    let cx = cx as i32;
+    let cy = cy as i32;
+
+    let plot = |buffer: &mut Buffer, x: i32, y: i32, ch: char| {
+        if x < 0 || y < 0 || x >= w || y >= h {
+            return;
+        }
+        let ax = area.x + x as u16;
+        let ay = area.y + y as u16;
+        if let Some(cell) = buffer.cell_mut((ax, ay)) {
+            cell.set_char(ch)
+                .set_fg(SAM_CROSS_FG)
+                .set_bg(SAM_CROSS_BG);
+            cell.modifier = Modifier::BOLD;
+        }
+    };
+
+    for dx in -arm..=arm {
+        let ch = if dx == 0 { '┼' } else { '─' };
+        plot(buffer, cx + dx, cy, ch);
+    }
+    for dy in -arm..=arm {
+        if dy == 0 {
+            continue;
+        }
+        plot(buffer, cx, cy + dy, '│');
+    }
+}
+
 fn draw_slider_row(
     buffer: &mut Buffer,
     x: u16,
@@ -1719,15 +1767,19 @@ fn render_image(buffer: &mut Buffer, area: Rect, app: &App) -> Result<()> {
             let bg = Color::Rgb(bottom[0], bottom[1], bottom[2]);
             if let Some(cell) = buffer.cell_mut((area.x + cell_x as u16, area.y + cell_y as u16)) {
                 cell.set_char('▀').set_fg(fg).set_bg(bg);
-                #[cfg(feature = "sam")]
-                if app.seg_mode
-                    && cell_x == app.seg_cursor_x as usize
-                    && cell_y == app.seg_cursor_y as usize
-                {
-                    cell.modifier.insert(Modifier::REVERSED);
-                }
             }
         }
+    }
+
+    #[cfg(feature = "sam")]
+    if app.seg_mode {
+        draw_sam_crosshair(
+            buffer,
+            area,
+            app.seg_cursor_x,
+            app.seg_cursor_y,
+            3,
+        );
     }
 
     Ok(())
