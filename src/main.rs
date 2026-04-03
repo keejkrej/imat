@@ -15,11 +15,16 @@ use image::{DynamicImage, ImageBuffer, Rgba, RgbaImage, imageops::FilterType};
 use ratatui::{
     Frame, Terminal, backend::CrosstermBackend, buffer::Buffer, layout::Rect, style::Color,
 };
+#[cfg(feature = "sam")]
+use ratatui::style::Modifier;
 use tiff::{
     ColorType,
     decoder::{BufferLayoutPreference, Decoder, DecodingBuffer, DecodingResult},
     tags::Tag,
 };
+
+#[cfg(feature = "sam")]
+use sam_rs::Sam1Session;
 
 const ALLOWED_EXTENSIONS: &[&str] = &[".png", ".jpg", ".jpeg", ".tif", ".tiff"];
 const HEADER_ROWS: u16 = 2;
@@ -31,6 +36,8 @@ const HEADER_DIM: Color = Color::Rgb(120, 120, 150);
 const HEADER_ERR: Color = Color::Rgb(255, 140, 140);
 const SLIDER_ACTIVE: Color = Color::Rgb(220, 220, 255);
 const SLIDER_THUMB: Color = Color::Rgb(255, 200, 120);
+#[cfg(feature = "sam")]
+const MASK_TINT: [u8; 3] = [72, 200, 120];
 
 fn main() {
     if let Err(error) = try_main() {
@@ -54,13 +61,35 @@ fn try_main() -> Result<()> {
         vec![volume.base_h, volume.base_w]
     };
 
+    #[cfg(feature = "sam")]
+    let sam_session = match (&cli.sam_encoder, &cli.sam_decoder) {
+        (None, None) => None,
+        (Some(enc), Some(dec)) => Some(
+            Sam1Session::new(enc.as_path(), dec.as_path(), false)
+                .with_context(|| "imat: failed to load SAM ONNX sessions")?,
+        ),
+        _ => {
+            bail!("imat: --sam-encoder and --sam-decoder must be given together");
+        }
+    };
+
+    #[cfg(feature = "sam")]
+    let mut app = App::new(cli.path, volume, view_shape, cli_shape_locked, sam_session);
+    #[cfg(not(feature = "sam"))]
     let mut app = App::new(cli.path, volume, view_shape, cli_shape_locked);
     run_app(&mut app)
 }
 
 fn usage() {
+    #[cfg(feature = "sam")]
+    eprintln!(
+        "usage: imat [--shape D0,D1,...,H,W] [--sam-encoder P --sam-decoder P] <image.png|jpg|jpeg|tif|tiff>"
+    );
+    #[cfg(not(feature = "sam"))]
     eprintln!("usage: imat [--shape D0,D1,...,H,W] <image.png|jpg|jpeg|tif|tiff>");
     eprintln!("  --shape: optional full row-major shape (product must equal RGBA pixel count)");
+    #[cfg(feature = "sam")]
+    eprintln!("  --sam-encoder / --sam-decoder: SAM1 ONNX models (requires `cargo build --features sam`)");
     eprintln!(
         "  multipage TIFF: one HxW plane per page (multi-sample pages split into consecutive planes); r reshape"
     );
@@ -68,16 +97,26 @@ fn usage() {
         "  reshape grid: factors with x or ,; product <= pages; use 0 once to infer one dimension (e.g. 3x0)"
     );
     eprintln!("  up/down active axis  left/right step  r reshape  Esc flat  q quit");
+    #[cfg(feature = "sam")]
+    eprintln!("  s SAM mode  hjkl cursor  Enter point  Esc exit SAM");
 }
 
 #[derive(Debug)]
 struct CliArgs {
     path: PathBuf,
     shape_spec: Option<String>,
+    #[cfg(feature = "sam")]
+    sam_encoder: Option<PathBuf>,
+    #[cfg(feature = "sam")]
+    sam_decoder: Option<PathBuf>,
 }
 
 fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
     let mut shape_spec = None;
+    #[cfg(feature = "sam")]
+    let mut sam_encoder = None;
+    #[cfg(feature = "sam")]
+    let mut sam_decoder = None;
     let mut positionals = Vec::new();
     let mut i = 0usize;
     while i < args.len() {
@@ -92,6 +131,32 @@ fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
                     bail!("imat: --shape requires a comma-separated list of positive integers");
                 }
                 shape_spec = Some(next.clone());
+                i += 2;
+            }
+            #[cfg(feature = "sam")]
+            "--sam-encoder" => {
+                let Some(next) = args.get(i + 1) else {
+                    usage();
+                    bail!("imat: --sam-encoder requires a path");
+                };
+                if next.starts_with('-') {
+                    usage();
+                    bail!("imat: --sam-encoder requires a path");
+                }
+                sam_encoder = Some(PathBuf::from(next));
+                i += 2;
+            }
+            #[cfg(feature = "sam")]
+            "--sam-decoder" => {
+                let Some(next) = args.get(i + 1) else {
+                    usage();
+                    bail!("imat: --sam-decoder requires a path");
+                };
+                if next.starts_with('-') {
+                    usage();
+                    bail!("imat: --sam-decoder requires a path");
+                }
+                sam_decoder = Some(PathBuf::from(next));
                 i += 2;
             }
             option if option.starts_with('-') => {
@@ -129,7 +194,14 @@ fn parse_cli_args(args: Vec<String>) -> Result<CliArgs> {
         bail!("imat: file not found: {}", path.display());
     }
 
-    Ok(CliArgs { path, shape_spec })
+    Ok(CliArgs {
+        path,
+        shape_spec,
+        #[cfg(feature = "sam")]
+        sam_encoder,
+        #[cfg(feature = "sam")]
+        sam_decoder,
+    })
 }
 
 fn extension_of(path: &Path) -> String {
@@ -726,6 +798,70 @@ fn linear_pixel_offset(indices: &[usize], strides: &[usize]) -> usize {
         .sum()
 }
 
+#[cfg(feature = "sam")]
+struct HalfBlockLayout {
+    scaled_w: u32,
+    scaled_h: u32,
+    off_x: u32,
+    off_y: u32,
+    slice_w: u32,
+    slice_h: u32,
+}
+
+#[cfg(feature = "sam")]
+fn halfblock_layout_for_slice(slice: &RgbaImage, area: Rect) -> Option<HalfBlockLayout> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let avail_w = area.width as u32;
+    let avail_h = area.height.saturating_mul(2) as u32;
+    let slice_w = slice.width();
+    let slice_h = slice.height();
+    let scaled = DynamicImage::ImageRgba8(slice.clone())
+        .resize(avail_w, avail_h, FilterType::Triangle)
+        .to_rgba8();
+    let off_x = avail_w.saturating_sub(scaled.width()) / 2;
+    let off_y = avail_h.saturating_sub(scaled.height()) / 2;
+    Some(HalfBlockLayout {
+        scaled_w: scaled.width(),
+        scaled_h: scaled.height(),
+        off_x,
+        off_y,
+        slice_w,
+        slice_h,
+    })
+}
+
+#[cfg(feature = "sam")]
+fn canvas_px_to_slice(layout: &HalfBlockLayout, px: u32, py: u32) -> (usize, usize) {
+    let sx = px.saturating_sub(layout.off_x)
+        .min(layout.scaled_w.saturating_sub(1));
+    let sy = py
+        .saturating_sub(layout.off_y)
+        .min(layout.scaled_h.saturating_sub(1));
+    let sw = layout.scaled_w.max(1);
+    let sh = layout.scaled_h.max(1);
+    let ox = (sx as u64 * layout.slice_w as u64 / sw as u64) as usize;
+    let oy = (sy as u64 * layout.slice_h as u64 / sh as u64) as usize;
+    (
+        ox.min(layout.slice_w.saturating_sub(1) as usize),
+        oy.min(layout.slice_h.saturating_sub(1) as usize),
+    )
+}
+
+#[cfg(feature = "sam")]
+fn tint_rgb_channel(rgb: [u8; 3], tint: [u8; 3], alpha: f32) -> [u8; 3] {
+    let a = alpha.clamp(0.0, 1.0);
+    let blend = |c: u8, t: u8| -> u8 {
+        ((c as f32 * (1.0 - a)) + (t as f32 * a)).round() as u8
+    };
+    [
+        blend(rgb[0], tint[0]),
+        blend(rgb[1], tint[1]),
+        blend(rgb[2], tint[2]),
+    ]
+}
+
 struct App {
     path: PathBuf,
     volume: Vec<u8>,
@@ -741,9 +877,63 @@ struct App {
     reshape_entry_active: bool,
     reshape_draft: String,
     reshape_error: Option<String>,
+    #[cfg(feature = "sam")]
+    sam: Option<Sam1Session>,
+    #[cfg(feature = "sam")]
+    seg_mode: bool,
+    #[cfg(feature = "sam")]
+    seg_cursor_x: u16,
+    #[cfg(feature = "sam")]
+    seg_cursor_y: u16,
+    #[cfg(feature = "sam")]
+    last_image_area: Option<Rect>,
+    #[cfg(feature = "sam")]
+    sam_cache_key: Option<(usize, usize, usize)>,
+    #[cfg(feature = "sam")]
+    sam_embedding: Option<sam_rs::SamImageEmbedding>,
+    #[cfg(feature = "sam")]
+    sam_mask: Option<Vec<u8>>,
+    #[cfg(feature = "sam")]
+    sam_last_error: Option<String>,
 }
 
 impl App {
+    #[cfg(feature = "sam")]
+    fn new(
+        path: PathBuf,
+        volume: Volume,
+        view_shape: Vec<usize>,
+        cli_shape_locked: bool,
+        sam: Option<Sam1Session>,
+    ) -> Self {
+        Self {
+            path,
+            volume: volume.buffer,
+            tiff_page_count: volume.page_count,
+            base_w: volume.base_w,
+            base_h: volume.base_h,
+            cli_shape_locked,
+            strides: lead_strides(&view_shape),
+            indices: vec![0; view_shape.len().saturating_sub(2)],
+            view_shape,
+            active_axis: 0,
+            flat_page_index: 0,
+            reshape_entry_active: false,
+            reshape_draft: String::new(),
+            reshape_error: None,
+            sam,
+            seg_mode: false,
+            seg_cursor_x: 0,
+            seg_cursor_y: 0,
+            last_image_area: None,
+            sam_cache_key: None,
+            sam_embedding: None,
+            sam_mask: None,
+            sam_last_error: None,
+        }
+    }
+
+    #[cfg(not(feature = "sam"))]
     fn new(path: PathBuf, volume: Volume, view_shape: Vec<usize>, cli_shape_locked: bool) -> Self {
         Self {
             path,
@@ -761,6 +951,78 @@ impl App {
             reshape_draft: String::new(),
             reshape_error: None,
         }
+    }
+
+    #[cfg(feature = "sam")]
+    fn invalidate_sam_cache(&mut self) {
+        self.sam_embedding = None;
+        self.sam_cache_key = None;
+        self.sam_mask = None;
+    }
+
+    #[cfg(feature = "sam")]
+    fn clamp_seg_cursor(&mut self, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        self.seg_cursor_x = self
+            .seg_cursor_x
+            .min(area.width.saturating_sub(1));
+        self.seg_cursor_y = self
+            .seg_cursor_y
+            .min(area.height.saturating_sub(1));
+    }
+
+    #[cfg(feature = "sam")]
+    fn ensure_sam_embedding(&mut self, rgba: &[u8], w: usize, h: usize, offset: usize) -> Result<()> {
+        let Some(ref mut sam) = self.sam else {
+            return Ok(());
+        };
+        let key = (offset, w, h);
+        if self.sam_cache_key == Some(key) && self.sam_embedding.is_some() {
+            return Ok(());
+        }
+        let emb = sam
+            .encode_rgba(rgba, h, w)
+            .map_err(|e| anyhow!("imat: SAM encode failed: {e}"))?;
+        self.sam_embedding = Some(emb);
+        self.sam_cache_key = Some(key);
+        Ok(())
+    }
+
+    #[cfg(feature = "sam")]
+    fn submit_sam_point(&mut self) -> Result<()> {
+        self.sam_last_error = None;
+        let Some(area) = self.last_image_area else {
+            self.sam_last_error = Some("resize terminal to refresh image area".to_owned());
+            return Ok(());
+        };
+        if self.sam.is_none() {
+            return Ok(());
+        }
+        let slice = self.rebuild_slice()?;
+        let slice_h = slice.height() as usize;
+        let slice_w = slice.width() as usize;
+        let offset = self.current_offset_pixels()?;
+        let rgba = slice.as_raw().to_vec();
+        self.ensure_sam_embedding(&rgba, slice_w, slice_h, offset)?;
+        let emb = self
+            .sam_embedding
+            .as_ref()
+            .context("imat: SAM embedding missing after encode")?;
+        let layout = halfblock_layout_for_slice(&slice, area)
+            .context("imat: could not compute layout for SAM prompt")?;
+        let px = self.seg_cursor_x as u32;
+        let py = self.seg_cursor_y as u32 * 2;
+        let (msx, msy) = canvas_px_to_slice(&layout, px, py);
+        let Some(mut sam) = self.sam.take() else {
+            return Ok(());
+        };
+        let decode = sam.decode_foreground_point(emb, msx as f32 + 0.5, msy as f32 + 0.5);
+        self.sam = Some(sam);
+        let mask = decode.map_err(|e| anyhow!("imat: SAM decode failed: {e}"))?;
+        self.sam_mask = Some(mask);
+        Ok(())
     }
 
     fn page_pixels(&self) -> usize {
@@ -827,6 +1089,8 @@ impl App {
         self.indices.clear();
         self.active_axis = 0;
         self.flat_page_index = page;
+        #[cfg(feature = "sam")]
+        self.invalidate_sam_cache();
     }
 
     fn apply_page_grid(&mut self) -> Result<()> {
@@ -847,6 +1111,8 @@ impl App {
         self.reshape_entry_active = false;
         self.reshape_draft.clear();
         self.reshape_error = None;
+        #[cfg(feature = "sam")]
+        self.invalidate_sam_cache();
         Ok(())
     }
 
@@ -867,8 +1133,83 @@ impl App {
             return Ok(false);
         }
 
+        #[cfg(feature = "sam")]
+        if self.seg_mode {
+            if self.sam.is_none() {
+                self.seg_mode = false;
+                return Ok(false);
+            }
+            match key.code {
+                KeyCode::Esc => {
+                    self.seg_mode = false;
+                    self.sam_last_error = None;
+                    return Ok(false);
+                }
+                KeyCode::Enter => {
+                    if let Err(error) = self.submit_sam_point() {
+                        self.sam_last_error =
+                            Some(error.to_string().replace("imat: ", ""));
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('s') => {
+                    self.seg_mode = false;
+                    self.sam_last_error = None;
+                    return Ok(false);
+                }
+                KeyCode::Char('h') => {
+                    self.seg_cursor_x = self.seg_cursor_x.saturating_sub(1);
+                    if let Some(a) = self.last_image_area {
+                        self.clamp_seg_cursor(a);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('l') => {
+                    self.seg_cursor_x = self.seg_cursor_x.saturating_add(1);
+                    if let Some(a) = self.last_image_area {
+                        self.clamp_seg_cursor(a);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('k') => {
+                    self.seg_cursor_y = self.seg_cursor_y.saturating_sub(1);
+                    if let Some(a) = self.last_image_area {
+                        self.clamp_seg_cursor(a);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('j') => {
+                    self.seg_cursor_y = self.seg_cursor_y.saturating_add(1);
+                    if let Some(a) = self.last_image_area {
+                        self.clamp_seg_cursor(a);
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down => {
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Char('q') => Ok(true),
+            #[cfg(feature = "sam")]
+            KeyCode::Char('s') => {
+                if self.sam.is_some() {
+                    self.seg_mode = true;
+                    self.sam_last_error = None;
+                    if let Some(a) = self.last_image_area {
+                        self.seg_cursor_x = a.width / 2;
+                        self.seg_cursor_y = a.height / 2;
+                    }
+                } else {
+                    self.sam_last_error = Some(
+                        "SAM models not loaded (use --sam-encoder and --sam-decoder)".to_owned(),
+                    );
+                }
+                Ok(false)
+            }
             KeyCode::Esc
                 if self.tiff_page_count > 1
                     && !self.cli_shape_locked
@@ -900,6 +1241,8 @@ impl App {
                     self.indices[self.active_axis] =
                         (self.indices[self.active_axis] + size - 1) % size;
                 }
+                #[cfg(feature = "sam")]
+                self.invalidate_sam_cache();
                 Ok(false)
             }
             KeyCode::Right => {
@@ -909,6 +1252,8 @@ impl App {
                     let size = self.view_shape[self.active_axis];
                     self.indices[self.active_axis] = (self.indices[self.active_axis] + 1) % size;
                 }
+                #[cfg(feature = "sam")]
+                self.invalidate_sam_cache();
                 Ok(false)
             }
             _ => Ok(false),
@@ -976,6 +1321,8 @@ fn run_event_loop(
     app: &mut App,
 ) -> Result<()> {
     loop {
+        #[cfg(feature = "sam")]
+        warm_sam_embedding_if_needed(app)?;
         terminal.draw(|frame| render(frame, app))?;
 
         if !event::poll(Duration::from_millis(250))
@@ -998,7 +1345,28 @@ fn run_event_loop(
     Ok(())
 }
 
-fn render(frame: &mut Frame<'_>, app: &App) {
+#[cfg(feature = "sam")]
+fn warm_sam_embedding_if_needed(app: &mut App) -> Result<()> {
+    if !app.seg_mode {
+        return Ok(());
+    }
+    if app.sam.is_none() {
+        return Ok(());
+    }
+    let slice = app.rebuild_slice()?;
+    let w = slice.width() as usize;
+    let h = slice.height() as usize;
+    if w == 0 || h == 0 {
+        return Ok(());
+    }
+    let offset = app.current_offset_pixels()?;
+    if let Err(error) = app.ensure_sam_embedding(slice.as_raw(), w, h, offset) {
+        app.sam_last_error = Some(error.to_string().replace("imat: ", ""));
+    }
+    Ok(())
+}
+
+fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = frame.area();
     let buffer = frame.buffer_mut();
     fill_area(
@@ -1082,6 +1450,13 @@ fn render(frame: &mut Frame<'_>, app: &App) {
         area.width,
         area.height - top_rows,
     );
+    #[cfg(feature = "sam")]
+    {
+        app.last_image_area = Some(image_area);
+        if app.seg_mode {
+            app.clamp_seg_cursor(image_area);
+        }
+    }
     let _ = render_image(buffer, image_area, app);
 }
 
@@ -1142,7 +1517,23 @@ fn header_lines(app: &App) -> (String, String, Color) {
         line
     };
 
+    #[cfg(feature = "sam")]
+    let mut line0 = line0;
+    #[cfg(feature = "sam")]
+    if let Some(error) = &app.sam_last_error {
+        line0.push_str("  ");
+        line0.push_str(error);
+    }
+
     let mut help = vec!["q quit".to_owned()];
+    #[cfg(feature = "sam")]
+    if app.sam.is_some() {
+        help.push("s SAM".to_owned());
+        if app.seg_mode {
+            help.push("hjkl point Enter".to_owned());
+            help.push("Esc exit SAM".to_owned());
+        }
+    }
     if app.tiff_page_count > 1 && !app.cli_shape_locked {
         help.push("r reshape".to_owned());
         if app.view_shape.len() > 2 {
@@ -1156,7 +1547,16 @@ fn header_lines(app: &App) -> (String, String, Color) {
         help.push("left/right".to_owned());
     }
 
-    (line0, help.join("  "), HEADER_FG)
+    #[cfg(not(feature = "sam"))]
+    let line0_color = HEADER_FG;
+    #[cfg(feature = "sam")]
+    let line0_color = if app.sam_last_error.is_some() {
+        HEADER_ERR
+    } else {
+        HEADER_FG
+    };
+
+    (line0, help.join("  "), line0_color)
 }
 
 fn join_shape(shape: &[usize]) -> String {
@@ -1269,7 +1669,7 @@ fn render_image(buffer: &mut Buffer, area: Rect, app: &App) -> Result<()> {
     }
 
     let slice = app.rebuild_slice()?;
-    let scaled = DynamicImage::ImageRgba8(slice)
+    let scaled = DynamicImage::ImageRgba8(slice.clone())
         .resize(available_w, available_h, FilterType::Triangle)
         .to_rgba8();
 
@@ -1285,14 +1685,47 @@ fn render_image(buffer: &mut Buffer, area: Rect, app: &App) -> Result<()> {
         }
     }
 
+    #[cfg(feature = "sam")]
+    let layout = halfblock_layout_for_slice(&slice, area);
+
     for cell_y in 0..area.height as usize {
         for cell_x in 0..area.width as usize {
             let top = canvas[(cell_y * 2) * available_w as usize + cell_x];
             let bottom = canvas[(cell_y * 2 + 1) * available_w as usize + cell_x];
+
+            #[cfg(feature = "sam")]
+            let (top, bottom) = {
+                let mut t = top;
+                let mut b = bottom;
+                if let (Some(ref layout), Some(ref mask)) = (layout.as_ref(), app.sam_mask.as_ref())
+                {
+                    let slice_w = layout.slice_w as usize;
+                    let (tx, ty) = canvas_px_to_slice(layout, cell_x as u32, (cell_y * 2) as u32);
+                    if mask.get(ty * slice_w + tx).copied().unwrap_or(0) > 0 {
+                        let rgb = tint_rgb_channel([t[0], t[1], t[2]], MASK_TINT, 0.38);
+                        t = [rgb[0], rgb[1], rgb[2], 255];
+                    }
+                    let (bx, by) =
+                        canvas_px_to_slice(layout, cell_x as u32, (cell_y * 2 + 1) as u32);
+                    if mask.get(by * slice_w + bx).copied().unwrap_or(0) > 0 {
+                        let rgb = tint_rgb_channel([b[0], b[1], b[2]], MASK_TINT, 0.38);
+                        b = [rgb[0], rgb[1], rgb[2], 255];
+                    }
+                }
+                (t, b)
+            };
+
+            let fg = Color::Rgb(top[0], top[1], top[2]);
+            let bg = Color::Rgb(bottom[0], bottom[1], bottom[2]);
             if let Some(cell) = buffer.cell_mut((area.x + cell_x as u16, area.y + cell_y as u16)) {
-                cell.set_char('▀')
-                    .set_fg(Color::Rgb(top[0], top[1], top[2]))
-                    .set_bg(Color::Rgb(bottom[0], bottom[1], bottom[2]));
+                cell.set_char('▀').set_fg(fg).set_bg(bg);
+                #[cfg(feature = "sam")]
+                if app.seg_mode
+                    && cell_x == app.seg_cursor_x as usize
+                    && cell_y == app.seg_cursor_y as usize
+                {
+                    cell.modifier.insert(Modifier::REVERSED);
+                }
             }
         }
     }
