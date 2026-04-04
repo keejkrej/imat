@@ -3,6 +3,10 @@ name = "imat"
 version = "0.1.0"
 edition = "2024"
 description = "Terminal image viewer (PNG/JPEG/TIFF) using ratatui"
+license = "MIT"
+repository = "https://github.com/keejkrej/imat-rs"
+keywords = ["image", "terminal", "viewer", "tiff", "ratatui"]
+categories = ["command-line-utilities", "multimedia::images"]
 
 [dependencies]
 anyhow = "1.0.102"
