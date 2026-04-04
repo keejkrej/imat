@@ -860,7 +860,7 @@ dependencies = [
 
 [[package]]
 name = "imat"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1964,7 +1964,8 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "sam-rs"
 version = "0.1.0"
-source = "git+https://github.com/keejkrej/sam-rs#ae067571d0c24a513fb7cf1c2d5a8f302c763e13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ee13f2df6d747b4531b71b96dfd2a79050017196e30e5e4bbb0394befbb36bc"
 dependencies = [
  "anyhow",
  "ndarray",
