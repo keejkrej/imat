@@ -1964,6 +1964,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "sam-rs"
 version = "0.1.0"
+source = "git+https://github.com/keejkrej/sam-rs#ae067571d0c24a513fb7cf1c2d5a8f302c763e13"
 dependencies = [
  "anyhow",
  "ndarray",

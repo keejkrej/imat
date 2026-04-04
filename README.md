@@ -13,7 +13,7 @@ cargo run -- <path/to/image.tif>
 
 ## SAM segmentation (optional)
 
-Build with the `sam` feature and pass ONNX models exported from the sibling [`../sam-rs`](../sam-rs) crate (`image_encoder.onnx` + `mask_decoder.onnx`, Meta SAM1-style, `return_single_mask=true` on the decoder).
+Build with the `sam` feature and pass ONNX models exported from [`keejkrej/sam-rs`](https://github.com/keejkrej/sam-rs) (`image_encoder.onnx` + `mask_decoder.onnx`, Meta SAM1-style, `return_single_mask=true` on the decoder).
 
 ```bash
 cargo run --features sam -- \
